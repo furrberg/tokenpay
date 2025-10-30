@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"encoding/json"
@@ -20,18 +19,12 @@ import (
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/furrberg/chainctl/qweezxc"
 	"github.com/gorilla/mux"
-	"github.com/spf13/cobra"
 )
 
 // global variables that are used to store data from server
 var (
-	userID        int
-	recipientID   int
-	ethAddress    string
-	amount        int
-	url           string
 	usersSnapshot Users
-	userVisible   User
+	UserVisible   User
 )
 
 //
@@ -42,124 +35,67 @@ type User struct {
 	Balance    int
 	EthAddress common.Address
 	privateKey *ecdsa.PrivateKey
-	AuthData   map[string]string
+}
+
+type authenticationMiddleware struct {
+	AuthData map[string]string
+}
+
+func (amw *authenticationMiddleware) addUser(usr *User) {
+	amw.AuthData[strconv.Itoa(rand.Intn(100))] = strconv.Itoa(usr.UserID)
+}
+
+func (amw *authenticationMiddleware) deleteUser(usr *User) {
+	for k, v := range amw.AuthData {
+		if v == strconv.Itoa(usr.UserID) {
+			delete(amw.AuthData, k)
+		}
+	}
+}
+
+func (amw *authenticationMiddleware) Middleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		token := r.Header.Get("X-Session-Token")
+		if user, found := amw.AuthData[token]; found {
+			// found the token in our map
+			log.Printf("Authenticated user %s\n", user)
+			// Pass down the request to the next middleware (or final handler)
+			next.ServeHTTP(w, r)
+		} else {
+			// Write an error and stop the handler chain
+			http.Error(w, "Forbidden", http.StatusForbidden)
+		}
+	})
+}
+
+type Request struct {
+	Amount      int    `json:"amount"`
+	RecipientID int    `json:"recipient_id"`
+	EthAddress  string `json:"eth_address"`
 }
 
 // Users map of all existing users
 type Users map[int]*User
 
-var rootCmd = &cobra.Command{
-	Use:   "tokenpay",
-	Short: "tokenpay is a tool for interacting with tokenpay",
-}
-
-// createUserCmd creates new user struct instance with 0 balance and adds it to the map of all users
-var createUserCmd = &cobra.Command{
-	Use:   "register",
-	Short: "Register a user",
-	RunE: func(cmd *cobra.Command, args []string) error {
-		resp, err := http.Get("localhost:8080/usernew")
-		if err != nil {
-			return err
-		}
-		err = json.NewDecoder(resp.Body).Decode(&userVisible)
-		if err != nil {
-			return err
-		}
-		fmt.Printf("User registered with ID %d and Address %d\n", userVisible.UserID, userVisible.EthAddress)
-		return nil
-	},
-}
-
-// transferCmd Used to transfer funds from one user id to another
-var transferCmd = &cobra.Command{
-	Use:   "transfer",
-	Short: "Transfer tokens",
-	RunE:  transfer,
-}
-
-func transfer(cmd *cobra.Command, args []string) error {
-	url = "http://localhost:8080/" + strconv.Itoa(userID) + "/transfer" + strconv.Itoa(amount) + strconv.Itoa(recipientID)
-	bytesObj := []byte(`{"key":"value"}`)
-	body := bytes.NewBuffer(bytesObj)
-	_, err := http.Post(url, "text/plain", body)
-	if err != nil {
-		return err
+func listener() error {
+	tokens := authenticationMiddleware{
+		AuthData: make(map[string]string),
 	}
-	fmt.Printf("%v was succesfuly sent to %v\n", amount, recipientID)
-
-	return nil
-}
-
-var withdrawCmd = &cobra.Command{
-	Use:   "withdraw",
-	Short: "Withdraw tokens",
-	RunE:  withdraw,
-}
-
-func withdraw(cmd *cobra.Command, args []string) error {
-	url = "http://localhost:8080/" + strconv.Itoa(userID) + "/withdraw" + strconv.Itoa(amount) + ethAddress
-	bytesObj := []byte(`{"key":"value"}`)
-	body := bytes.NewBuffer(bytesObj)
-	_, err := http.Post(url, "text/plain", body)
-	if err != nil {
-		return err
-	}
-	fmt.Printf("%v was succesfuly withdrawn to %v\n", amount, ethAddress)
-
-	return nil
-}
-
-var getDataCmd = &cobra.Command{
-	Use:   "get",
-	Short: "Get data",
-	RunE: func(cmd *cobra.Command, args []string) error {
-		url = "http://localhost:8080/" + strconv.Itoa(userID) + "/get-data"
-		resp, err := http.Get(url)
-		if err != nil {
-			return err
-		}
-		err = json.NewDecoder(resp.Body).Decode(&userVisible)
-		if err != nil {
-			return err
-		}
-
-		fmt.Println(userVisible.UserID, userVisible.EthAddress, userVisible.Balance)
-
-		return nil
-	},
-}
-
-var checkBalanceCmd = &cobra.Command{
-	Use:   "checkbalance",
-	Short: "Check balance",
-	RunE: func(cmd *cobra.Command, args []string) error {
-		url = "http://localhost:8080/" + strconv.Itoa(userID) + "/check-balance"
-		resp, err := http.Get(url)
-		if err != nil {
-			return err
-		}
-		err = json.NewDecoder(resp.Body).Decode(&userVisible)
-		if err != nil {
-			return err
-		}
-
-		fmt.Printf("Your current balance is %v\n", userVisible.Balance)
-		return nil
-	},
-}
-
-func listener() {
 	users := make(Users)
 	router := mux.NewRouter()
 
 	// router Endpoints
 	router.HandleFunc("/users", func(writer http.ResponseWriter, request *http.Request) {
-		json.NewEncoder(writer).Encode(users)
+		err := json.NewEncoder(writer).Encode(users)
+		if err != nil {
+			http.Error(writer, err.Error(), http.StatusInternalServerError)
+			return
+		}
 	}).Methods("GET")
 	router.HandleFunc("/usernew", func(writer http.ResponseWriter, request *http.Request) {
 		key, err := crypto.GenerateKey()
 		if err != nil {
+			http.Error(writer, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
@@ -170,16 +106,18 @@ func listener() {
 			privateKey: key,
 		}
 
-		userVisible = User{
+		UserVisible = User{
 			UserID:     user.UserID,
 			Balance:    user.Balance,
 			EthAddress: user.EthAddress,
 		}
 
 		users[user.UserID] = &user
+		tokens.addUser(&user)
 		usersSnapshot = users
-		err = json.NewEncoder(writer).Encode(userVisible)
+		err = json.NewEncoder(writer).Encode(UserVisible)
 		if err != nil {
+			http.Error(writer, err.Error(), http.StatusInternalServerError)
 			return
 		}
 	}).Methods("GET")
@@ -187,15 +125,14 @@ func listener() {
 		params := mux.Vars(request)
 		userID, err := strconv.Atoi(params["id"])
 		if err != nil {
-			_, err2 := fmt.Fprintln(writer, err)
-			if err2 != nil {
-				return
-			}
+			http.Error(writer, err.Error(), http.StatusInternalServerError)
+			return
 		}
 		for _, user := range users {
 			if user.UserID == userID {
 				err = json.NewEncoder(writer).Encode(users[userID])
 				if err != nil {
+					http.Error(writer, err.Error(), http.StatusInternalServerError)
 					return
 				}
 			}
@@ -205,15 +142,14 @@ func listener() {
 		params := mux.Vars(request)
 		userID, err := strconv.Atoi(params["id"])
 		if err != nil {
-			_, err2 := fmt.Fprintln(writer, err)
-			if err2 != nil {
-				return
-			}
+			http.Error(writer, err.Error(), http.StatusInternalServerError)
+			return
 		}
 		for _, user := range users {
 			if user.UserID == userID {
 				err = json.NewEncoder(writer).Encode(users[userID].Balance)
 				if err != nil {
+					http.Error(writer, err.Error(), http.StatusInternalServerError)
 					return
 				}
 			}
@@ -223,15 +159,14 @@ func listener() {
 		params := mux.Vars(request)
 		userID, err := strconv.Atoi(params["id"])
 		if err != nil {
-			_, err2 := fmt.Fprintln(writer, err)
-			if err2 != nil {
-				return
-			}
+			http.Error(writer, err.Error(), http.StatusInternalServerError)
+			return
 		}
 		for _, user := range users {
 			if user.UserID == userID {
 				err = json.NewEncoder(writer).Encode(users[userID].EthAddress)
 				if err != nil {
+					http.Error(writer, err.Error(), http.StatusInternalServerError)
 					return
 				}
 			}
@@ -241,15 +176,14 @@ func listener() {
 		params := mux.Vars(request)
 		userID, err := strconv.Atoi(params["id"])
 		if err != nil {
-			_, err2 := fmt.Fprintln(writer, err)
-			if err2 != nil {
-				return
-			}
+			http.Error(writer, err.Error(), http.StatusInternalServerError)
+			return
 		}
 		for _, user := range users {
 			if user.UserID == userID {
 				err = json.NewEncoder(writer).Encode(users[userID].UserID)
 				if err != nil {
+					http.Error(writer, err.Error(), http.StatusInternalServerError)
 					return
 				}
 			}
@@ -259,10 +193,8 @@ func listener() {
 		params := mux.Vars(request)
 		userID, err := strconv.Atoi(params["id"])
 		if err != nil {
-			_, err2 := fmt.Fprintln(writer, err)
-			if err2 != nil {
-				return
-			}
+			http.Error(writer, err.Error(), http.StatusInternalServerError)
+			return
 		}
 		for _, user := range users {
 			if user.UserID == userID {
@@ -273,6 +205,7 @@ func listener() {
 				}
 				err = json.NewEncoder(writer).Encode(usrData)
 				if err != nil {
+					http.Error(writer, err.Error(), http.StatusInternalServerError)
 					return
 				}
 			}
@@ -282,40 +215,51 @@ func listener() {
 		params := mux.Vars(request)
 		userID, err := strconv.Atoi(params["id"])
 		if err != nil {
-			_, err2 := fmt.Fprintln(writer, err)
-			if err2 != nil {
-				return
-			}
+			http.Error(writer, err.Error(), http.StatusInternalServerError)
+			return
 		}
 		for _, user := range users {
 			if user.UserID == userID {
 				_, ok := users[userID]
 				if ok {
 					delete(users, userID)
+					tokens.deleteUser(user)
 				}
 			}
 		}
 		usersSnapshot = users
 	}).Methods("DELETE")
 	// http transfer function that allows to transfer available funds to other used id balance
-	router.HandleFunc("/users/{id}/transfer{amount}{recipientid}", func(writer http.ResponseWriter, request *http.Request) {
+	router.HandleFunc("/users/{id}/transfer", func(writer http.ResponseWriter, request *http.Request) {
 		params := mux.Vars(request)
 		userID, err := strconv.Atoi(params["id"])
-		amount, err := strconv.Atoi(params["amount"])
-		recipient, err := strconv.Atoi(params["recipientid"])
 		if err != nil {
-			_, err2 := fmt.Fprintln(writer, err)
-			if err2 != nil {
-				return
-			}
+			http.Error(writer, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		var requestBody Request
+		err = json.NewDecoder(request.Body).Decode(&requestBody)
+		if err != nil {
+			http.Error(writer, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		amount := requestBody.Amount
+		recipient := requestBody.RecipientID
+
+		if err != nil {
+			http.Error(writer, err.Error(), http.StatusInternalServerError)
+			return
 		}
 		for _, user := range users {
 			if user.UserID == userID {
 				if user.Balance < amount {
-					fmt.Fprintln(writer, "Insufficient balance")
+					http.Error(writer, "Insufficient balance!", http.StatusInternalServerError)
+					return
 				}
 				if _, ok := users[recipient]; !ok {
-					fmt.Fprintln(writer, "User not found")
+					http.Error(writer, "User not found.", http.StatusInternalServerError)
+					return
 				}
 				user.Balance -= amount
 				users[recipient].Balance += amount
@@ -324,55 +268,62 @@ func listener() {
 		usersSnapshot = users
 	}).Methods("POST")
 
-	router.HandleFunc("/users/{id}/withdraw{amount}{address}", func(writer http.ResponseWriter, request *http.Request) {
+	router.HandleFunc("/users/{id}/withdraw", func(writer http.ResponseWriter, request *http.Request) {
 		params := mux.Vars(request)
+		requestBody := Request{}
+		err := json.NewDecoder(request.Body).Decode(&requestBody)
 		userID, err := strconv.Atoi(params["id"])
 		if err != nil {
-			fmt.Fprintln(writer, err)
+			http.Error(writer, err.Error(), http.StatusInternalServerError)
+			return
 		}
-		amount, err := strconv.Atoi(params["amount"])
-		if err != nil {
-			fmt.Fprintln(writer, err)
-		}
-		recipient := common.HexToAddress(params["address"])
+		amount := requestBody.Amount
+		recipient := common.HexToAddress(requestBody.EthAddress)
 
 		for _, user := range users {
 			if user.UserID == userID {
 				if user.Balance < amount {
-					fmt.Fprintln(writer, "Insufficient balance")
+					http.Error(writer, "Insufficient balance!", http.StatusInternalServerError)
+					return
 				}
 				user.Balance -= amount
 
-				client, err := ethclient.Dial(url)
+				client, err := ethclient.Dial("ws://127.0.0.1:8545")
 				if err != nil {
-					fmt.Fprintln(writer, err)
+					http.Error(writer, err.Error(), http.StatusInternalServerError)
+					return
 				}
 
 				contractAddress := common.HexToAddress("0x5FbDB2315678afecb367f032d93F642f64180aa3")
 
 				instance, err := qweezxc.NewQweezxc(contractAddress, client)
 				if err != nil {
-					fmt.Fprintln(writer, err)
+					http.Error(writer, err.Error(), http.StatusInternalServerError)
+					return
 				}
 
 				chainID, ok := new(big.Int).SetString("31337", 10)
 				if !ok {
-					fmt.Fprintln(writer, err)
+					http.Error(writer, err.Error(), http.StatusInternalServerError)
+					return
 				}
 
 				nonce, err := client.PendingNonceAt(context.Background(), user.EthAddress)
 				if err != nil {
-					log.Fatal(err)
+					http.Error(writer, err.Error(), http.StatusInternalServerError)
+					return
 				}
 
 				gasPrice, err := client.SuggestGasPrice(context.Background())
 				if err != nil {
-					log.Fatal(err)
+					http.Error(writer, err.Error(), http.StatusInternalServerError)
+					return
 				}
 
 				authSpender, err := bind.NewKeyedTransactorWithChainID(user.privateKey, chainID)
 				if err != nil {
-					fmt.Fprintln(writer, err)
+					http.Error(writer, err.Error(), http.StatusInternalServerError)
+					return
 				}
 				authSpender.Nonce = big.NewInt(int64(nonce))
 				authSpender.Value = big.NewInt(0) // in wei
@@ -383,11 +334,13 @@ func listener() {
 
 				privateKeyOwner, err := crypto.HexToECDSA("0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")
 				if err != nil {
-					fmt.Fprintln(writer, err)
+					http.Error(writer, err.Error(), http.StatusInternalServerError)
+					return
 				}
 				authOwner, err := bind.NewKeyedTransactorWithChainID(privateKeyOwner, chainID)
 				if err != nil {
-					fmt.Fprintln(writer, err)
+					http.Error(writer, err.Error(), http.StatusInternalServerError)
+					return
 				}
 				authOwner.Nonce = big.NewInt(int64(nonce))
 				authOwner.Value = big.NewInt(0) // in wei
@@ -396,10 +349,12 @@ func listener() {
 
 				_, err = instance.Approve(authOwner, user.EthAddress, new(big.Int).SetInt64(int64(amount)))
 				if err != nil {
+					http.Error(writer, err.Error(), http.StatusInternalServerError)
 					return
 				}
 				_, err = instance.TransferFrom(authSpender, common.HexToAddress("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"), recipient, new(big.Int).SetInt64(int64(amount)))
 				if err != nil {
+					http.Error(writer, err.Error(), http.StatusInternalServerError)
 					return
 				}
 
@@ -411,11 +366,13 @@ func listener() {
 	}).Methods("POST")
 
 	log.Fatal(http.ListenAndServe(":8080", router))
+
+	return nil
 }
 
 // autoTransfer transfers tokens from user eth addresses to main address every period
 func autoTransfer() {
-	client, err := ethclient.Dial(url)
+	client, err := ethclient.Dial("ws://127.0.0.1:8545")
 	if err != nil {
 		fmt.Errorf(err.Error())
 	}
@@ -468,62 +425,51 @@ func autoTransfer() {
 	}
 }
 
-func init() {
-	rootCmd.AddCommand(createUserCmd)
-	rootCmd.AddCommand(transferCmd)
-	rootCmd.AddCommand(withdrawCmd)
-	rootCmd.AddCommand(getDataCmd)
-	rootCmd.AddCommand(checkBalanceCmd)
-	transferCmd.Flags().IntVar(&userID, "id", 0, "User ID")
-	transferCmd.Flags().IntVarP(&amount, "amount", "a", 1, "Amount to transfer")
-	transferCmd.Flags().IntVarP(&recipientID, "recipient", "r", 0, "Recipient ID")
-	withdrawCmd.Flags().IntVar(&userID, "id", 0, "User ID")
-	withdrawCmd.Flags().StringVar(&ethAddress, "address", "", "Amount to withdraw")
-	withdrawCmd.Flags().IntVarP(&amount, "amount", "a", 0, "Amount to withdraw")
-	getDataCmd.Flags().IntVar(&userID, "id", 0, "User ID")
-	checkBalanceCmd.Flags().IntVar(&userID, "id", 0, "User ID")
-	err := transferCmd.MarkFlagRequired("id")
+func depositListener() {
+	depositEvent := make(chan *qweezxc.QweezxcTransfer)
+	client, err := ethclient.Dial("ws://127.0.0.1:8545")
+	if err != nil {
+		fmt.Errorf(err.Error())
+	}
+
+	instance, err := qweezxc.NewQweezxc(common.HexToAddress("0x5FbDB2315678afecb367f032d93F642f64180aa3"), client)
 	if err != nil {
 		fmt.Println(err)
 	}
-	err = transferCmd.MarkFlagRequired("amount")
-	if err != nil {
-		fmt.Println(err)
-	}
-	err = transferCmd.MarkFlagRequired("recipient")
-	if err != nil {
-		fmt.Println(err)
-	}
-	err = withdrawCmd.MarkFlagRequired("id")
-	if err != nil {
-		fmt.Println(err)
-	}
-	err = withdrawCmd.MarkFlagRequired("address")
-	if err != nil {
-		fmt.Println(err)
-	}
-	err = withdrawCmd.MarkFlagRequired("amount")
-	if err != nil {
-		fmt.Println(err)
-	}
-	err = getDataCmd.MarkFlagRequired("id")
-	if err != nil {
-		fmt.Println(err)
-	}
-	err = checkBalanceCmd.MarkFlagRequired("id")
-	if err != nil {
-		fmt.Println(err)
+
+	for {
+		to := []common.Address{}
+		for _, v := range usersSnapshot {
+			to = append(to, v.EthAddress)
+		}
+
+		from := []common.Address{common.HexToAddress("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266")}
+
+		_, err = instance.WatchTransfer(nil, depositEvent, from, to)
+		if err != nil {
+			fmt.Println(err.Error())
+		}
+		for {
+			select {
+			case tx := <-depositEvent:
+				for _, v := range usersSnapshot {
+					if v.EthAddress.Hex() == tx.To.Hex() {
+						sum := v.Balance
+						v.Balance += int(tx.Value.Int64())
+						sum = v.Balance - sum
+						fmt.Printf("Deposited %v tokens successfully to %v\n", sum, v.UserID)
+					}
+				}
+			}
+		}
 	}
 }
 
 func main() {
 	wg := new(sync.WaitGroup)
 	wg.Go(autoTransfer)
-	wg.Go(listener)
-
-	err := rootCmd.Execute()
+	err := listener()
 	if err != nil {
-		return
+		fmt.Println(err)
 	}
-	wg.Wait()
 }
