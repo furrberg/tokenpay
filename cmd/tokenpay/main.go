@@ -10,11 +10,14 @@ import (
 	"math/rand"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
-	"time"
 
+	"github.com/ethereum/go-ethereum"
+	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/furrberg/chainctl/qweezxc"
@@ -23,7 +26,7 @@ import (
 
 // global variables that are used to store data from server
 var (
-	usersSnapshot Users
+	usersSnapshot *Users
 	UserVisible   User
 )
 
@@ -99,7 +102,7 @@ func listener() error {
 			return
 		}
 
-		user := User{
+		user := &User{
 			UserID:     rand.Int(),
 			Balance:    0,
 			EthAddress: crypto.PubkeyToAddress(key.PublicKey),
@@ -112,9 +115,9 @@ func listener() error {
 			EthAddress: user.EthAddress,
 		}
 
-		users[user.UserID] = &user
-		tokens.addUser(&user)
-		usersSnapshot = users
+		users[user.UserID] = user
+		tokens.addUser(user)
+		usersSnapshot = &users
 		err = json.NewEncoder(writer).Encode(UserVisible)
 		if err != nil {
 			http.Error(writer, err.Error(), http.StatusInternalServerError)
@@ -227,7 +230,7 @@ func listener() error {
 				}
 			}
 		}
-		usersSnapshot = users
+		usersSnapshot = &users
 	}).Methods("DELETE")
 	// http transfer function that allows to transfer available funds to other used id balance
 	router.HandleFunc("/users/{id}/transfer", func(writer http.ResponseWriter, request *http.Request) {
@@ -265,7 +268,7 @@ func listener() error {
 				users[recipient].Balance += amount
 			}
 		}
-		usersSnapshot = users
+		usersSnapshot = &users
 	}).Methods("POST")
 
 	router.HandleFunc("/users/{id}/withdraw", func(writer http.ResponseWriter, request *http.Request) {
@@ -362,7 +365,7 @@ func listener() error {
 				fmt.Fprintln(writer, "New balance: %v\n", user.Balance)
 			}
 		}
-		usersSnapshot = users
+		usersSnapshot = &users
 	}).Methods("POST")
 
 	log.Fatal(http.ListenAndServe(":8080", router))
@@ -370,9 +373,21 @@ func listener() error {
 	return nil
 }
 
-// autoTransfer transfers tokens from user eth addresses to main address every period
-func autoTransfer() {
+// depositListener Listens to all deposit transactions coming onto user public addresses.
+func depositListener() {
+	depositEvent := make(chan types.Log)
+	var transferEvent struct {
+		From  common.Address
+		To    common.Address
+		Value *big.Int
+	}
+
 	client, err := ethclient.Dial("ws://127.0.0.1:8545")
+	if err != nil {
+		fmt.Errorf(err.Error())
+	}
+
+	contractAbi, err := abi.JSON(strings.NewReader(`[{"type":"event","name":"Transfer","inputs":[{"indexed":true,"name":"from","type":"address"},{"indexed":true,"name":"to","type":"address"},{"indexed":false,"name":"value","type":"uint256"}]}]`))
 	if err != nil {
 		fmt.Errorf(err.Error())
 	}
@@ -381,15 +396,34 @@ func autoTransfer() {
 	if err != nil {
 		fmt.Println(err)
 	}
+
+	query := ethereum.FilterQuery{
+		Addresses: []common.Address{
+			common.HexToAddress("0x5FbDB2315678afecb367f032d93F642f64180aa3"),
+		},
+		Topics: [][]common.Hash{{contractAbi.Events["Transfer"].ID}},
+	}
+
+	sub, err := client.SubscribeFilterLogs(context.Background(), query, depositEvent)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer sub.Unsubscribe()
+
 	for {
 		select {
-		case <-time.Tick(10 * time.Second):
-			for _, v := range usersSnapshot {
-				balance, err := instance.BalanceOf(nil, v.EthAddress)
-				if err != nil {
-					fmt.Println(err)
-				}
-				if balance.Int64() > 0 {
+		case err := <-sub.Err():
+			log.Fatal(err)
+		case vLog := <-depositEvent:
+			err = contractAbi.UnpackIntoInterface(&transferEvent, "Transfer", vLog.Data)
+			if err != nil {
+				log.Fatal(err)
+			}
+			transferEvent.From = common.BytesToAddress(vLog.Topics[1].Bytes())
+			transferEvent.To = common.BytesToAddress(vLog.Topics[2].Bytes())
+			for _, v := range *usersSnapshot {
+				if transferEvent.To.Hex() == v.EthAddress.Hex() {
+					v.Balance = v.Balance + int(transferEvent.Value.Int64())
 					chainID, ok := new(big.Int).SetString("31337", 10)
 					if !ok {
 						fmt.Println(err)
@@ -414,51 +448,11 @@ func autoTransfer() {
 					authOwner.GasLimit = uint64(0)  // in units
 					authOwner.GasPrice = gasPrice
 
-					_, err = instance.Transfer(authOwner, common.HexToAddress("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"), balance)
+					_, err = instance.Transfer(authOwner, common.HexToAddress("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"), transferEvent.Value)
 					if err != nil {
 						return
 					}
-					fmt.Printf("Transferred %v tokens successfully to main account from %v\n", balance.Int64(), v.EthAddress)
-				}
-			}
-		}
-	}
-}
-
-func depositListener() {
-	depositEvent := make(chan *qweezxc.QweezxcTransfer)
-	client, err := ethclient.Dial("ws://127.0.0.1:8545")
-	if err != nil {
-		fmt.Errorf(err.Error())
-	}
-
-	instance, err := qweezxc.NewQweezxc(common.HexToAddress("0x5FbDB2315678afecb367f032d93F642f64180aa3"), client)
-	if err != nil {
-		fmt.Println(err)
-	}
-
-	for {
-		to := []common.Address{}
-		for _, v := range usersSnapshot {
-			to = append(to, v.EthAddress)
-		}
-
-		from := []common.Address{common.HexToAddress("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266")}
-
-		_, err = instance.WatchTransfer(nil, depositEvent, from, to)
-		if err != nil {
-			fmt.Println(err.Error())
-		}
-		for {
-			select {
-			case tx := <-depositEvent:
-				for _, v := range usersSnapshot {
-					if v.EthAddress.Hex() == tx.To.Hex() {
-						sum := v.Balance
-						v.Balance += int(tx.Value.Int64())
-						sum = v.Balance - sum
-						fmt.Printf("Deposited %v tokens successfully to %v\n", sum, v.UserID)
-					}
+					fmt.Printf("Deposited %v tokens successfully", transferEvent.Value.Int64())
 				}
 			}
 		}
@@ -467,7 +461,7 @@ func depositListener() {
 
 func main() {
 	wg := new(sync.WaitGroup)
-	wg.Go(autoTransfer)
+	wg.Go(depositListener)
 	err := listener()
 	if err != nil {
 		fmt.Println(err)

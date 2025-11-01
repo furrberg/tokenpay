@@ -26,7 +26,6 @@ type Usr struct {
 	Balance    int
 	EthAddress common.Address
 	privateKey *ecdsa.PrivateKey
-	AuthData   map[string]string
 }
 
 var rootCmd = &cobra.Command{
@@ -141,12 +140,12 @@ var checkBalanceCmd = &cobra.Command{
 	Use:   "checkbalance",
 	Short: "Check balance",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		url = "http://localhost:8080/" + strconv.Itoa(userID) + "/check-balance"
+		url = fmt.Sprintf("http://localhost:8080/users/%d/check-balance", userID)
 		resp, err := http.Get(url)
 		if err != nil {
 			return err
 		}
-		err = json.NewDecoder(resp.Body).Decode(&userVisible)
+		err = json.NewDecoder(resp.Body).Decode(&userVisible.Balance)
 		if err != nil {
 			return err
 		}
