@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi"
@@ -85,6 +86,7 @@ func listener() error {
 		AuthData: make(map[string]string),
 	}
 	users := make(Users)
+	usersSnapshot = &users
 	router := mux.NewRouter()
 
 	// router Endpoints
@@ -117,7 +119,6 @@ func listener() error {
 
 		users[user.UserID] = user
 		tokens.addUser(user)
-		usersSnapshot = &users
 		err = json.NewEncoder(writer).Encode(UserVisible)
 		if err != nil {
 			http.Error(writer, err.Error(), http.StatusInternalServerError)
@@ -373,9 +374,98 @@ func listener() error {
 	return nil
 }
 
+// autoTransfer Transfers tokens from user address to main wallet if balance of it is more than 1000 tokens
+func autoTransfer() {
+	client, err := ethclient.Dial("ws://127.0.0.1:8545")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	instance, err := qweezxc.NewQweezxc(common.HexToAddress("0x5FbDB2315678afecb367f032d93F642f64180aa3"), client)
+	if err != nil {
+		log.Fatal(err)
+	}
+	for {
+		select {
+		case <-time.Tick(30 * time.Second):
+			for _, v := range *usersSnapshot {
+				balance, err := instance.BalanceOf(nil, v.EthAddress)
+				if err != nil {
+					log.Fatal(err)
+				}
+				if balance.Int64() >= 1000 {
+					chainID, ok := new(big.Int).SetString("31337", 10)
+					if !ok {
+						fmt.Println(err)
+					}
+
+					privateKey, err := crypto.HexToECDSA("")
+					if err != nil {
+						fmt.Println(err)
+					}
+
+					nonce, err := client.PendingNonceAt(context.Background(), common.HexToAddress(""))
+					if err != nil {
+						fmt.Println(err)
+					}
+
+					gasPrice, err := client.SuggestGasPrice(context.Background())
+					if err != nil {
+						fmt.Println(err)
+					}
+
+					txData := new(types.LegacyTx)
+					txData.Nonce = nonce
+					txData.GasPrice = gasPrice
+					*txData.To = v.EthAddress
+					txData.Gas = uint64(100000)
+					txData.Value = big.NewInt(gasPrice.Int64() + 1e13)
+					txData.Data = []byte{}
+					tx := types.NewTx(txData)
+					signedTx, err := types.SignTx(tx, types.NewEIP155Signer(chainID), privateKey)
+					if err != nil {
+						return
+					}
+					err = client.SendTransaction(context.Background(), signedTx)
+					if err != nil {
+						log.Fatal(err)
+					}
+
+					nonce, err = client.PendingNonceAt(context.Background(), v.EthAddress)
+					if err != nil {
+						fmt.Println(err)
+					}
+
+					gasPrice, err = client.SuggestGasPrice(context.Background())
+					if err != nil {
+						fmt.Println(err)
+					}
+
+					authUser, err := bind.NewKeyedTransactorWithChainID(v.privateKey, chainID)
+					if err != nil {
+						fmt.Println(err)
+					}
+
+					authUser.Nonce = big.NewInt(int64(nonce))
+					authUser.Value = big.NewInt(0) // in wei
+					authUser.GasLimit = uint64(0)  // in units
+					authUser.GasPrice = gasPrice
+
+					_, err = instance.Transfer(authUser, common.HexToAddress(""), balance)
+					if err != nil {
+						log.Fatal(err)
+					}
+
+					log.Printf("%v was transfered from %v to main", balance, v.EthAddress)
+				}
+			}
+		}
+	}
+}
+
 // depositListener Listens to all deposit transactions coming onto user public addresses.
 func depositListener() {
-	depositEvent := make(chan types.Log)
+	depositEvent := make(chan types.Log, 1)
 	var transferEvent struct {
 		From  common.Address
 		To    common.Address
@@ -392,7 +482,7 @@ func depositListener() {
 		fmt.Errorf(err.Error())
 	}
 
-	instance, err := qweezxc.NewQweezxc(common.HexToAddress("0x5FbDB2315678afecb367f032d93F642f64180aa3"), client)
+	_, err = qweezxc.NewQweezxc(common.HexToAddress("0x5FbDB2315678afecb367f032d93F642f64180aa3"), client)
 	if err != nil {
 		fmt.Println(err)
 	}
@@ -423,35 +513,8 @@ func depositListener() {
 			transferEvent.To = common.BytesToAddress(vLog.Topics[2].Bytes())
 			for _, v := range *usersSnapshot {
 				if transferEvent.To.Hex() == v.EthAddress.Hex() {
+					log.Printf("current balance is %v\n", v.Balance)
 					v.Balance = v.Balance + int(transferEvent.Value.Int64())
-					chainID, ok := new(big.Int).SetString("31337", 10)
-					if !ok {
-						fmt.Println(err)
-					}
-
-					nonce, err := client.PendingNonceAt(context.Background(), v.EthAddress)
-					if err != nil {
-						fmt.Println(err)
-					}
-
-					gasPrice, err := client.SuggestGasPrice(context.Background())
-					if err != nil {
-						fmt.Println(err)
-					}
-
-					authOwner, err := bind.NewKeyedTransactorWithChainID(v.privateKey, chainID)
-					if err != nil {
-						fmt.Println(err)
-					}
-					authOwner.Nonce = big.NewInt(int64(nonce))
-					authOwner.Value = big.NewInt(0) // in wei
-					authOwner.GasLimit = uint64(0)  // in units
-					authOwner.GasPrice = gasPrice
-
-					_, err = instance.Transfer(authOwner, common.HexToAddress("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"), transferEvent.Value)
-					if err != nil {
-						return
-					}
 					fmt.Printf("Deposited %v tokens successfully", transferEvent.Value.Int64())
 				}
 			}
@@ -462,6 +525,7 @@ func depositListener() {
 func main() {
 	wg := new(sync.WaitGroup)
 	wg.Go(depositListener)
+	wg.Go(autoTransfer)
 	err := listener()
 	if err != nil {
 		fmt.Println(err)
