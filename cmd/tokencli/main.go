@@ -5,6 +5,7 @@ import (
 	"crypto/ecdsa"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 
@@ -79,7 +80,15 @@ func transfer(cmd *cobra.Command, args []string) error {
 
 	resp, err := http.Post(url, "application/json", body)
 	if err != nil {
+		return fmt.Errorf(err.Error())
+	}
+	respBody, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
 		return err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf(string(respBody))
 	}
 	defer resp.Body.Close()
 	fmt.Printf("%v was succesfuly sent to %v\n", amount, recipientID)
@@ -109,8 +118,16 @@ func withdraw(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	respBody, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf(string(respBody))
+	}
 	defer resp.Body.Close()
-	fmt.Printf("%v was succesfuly withdrawn to %v\n", amount, ethAddress)
+	fmt.Println(respBody)
 
 	return nil
 }
@@ -165,7 +182,7 @@ func init() {
 	transferCmd.Flags().IntVarP(&amount, "amount", "a", 1, "Amount to transfer")
 	transferCmd.Flags().IntVarP(&recipientID, "recipient", "r", 0, "Recipient ID")
 	withdrawCmd.Flags().IntVar(&userID, "id", 0, "User ID")
-	withdrawCmd.Flags().StringVar(&ethAddress, "address", "", "Amount to withdraw")
+	withdrawCmd.Flags().StringVar(&ethAddress, "address", "", "Address to withdraw")
 	withdrawCmd.Flags().IntVarP(&amount, "amount", "a", 0, "Amount to withdraw")
 	getDataCmd.Flags().IntVar(&userID, "id", 0, "User ID")
 	checkBalanceCmd.Flags().IntVar(&userID, "id", 0, "User ID")
